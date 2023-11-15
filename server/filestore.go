@@ -1567,9 +1567,12 @@ func (fs *fileStore) recoverFullState() (rerr error) {
 	fn := filepath.Join(fs.fcfg.StoreDir, msgDir, streamStreamStateFile)
 	buf, err := os.ReadFile(fn)
 	if err != nil {
-		log.Printf("OHDBG: bonus log in case channel gets blocked in recoverFullState, should be followed by \"Could not read stream state file\", err=[%s]", err)
+		log.Printf("OHDBG: bonus log in case channel gets blocked in recoverFullState, err=[%s]", err)
 	}
 	dios <- struct{}{}
+	if err != nil {
+		log.Printf("OHDBG: bonus log got past the chan block in recoverFullState, err=[%s]", err)
+	}
 
 	if err != nil {
 		if !os.IsNotExist(err) {
@@ -1985,8 +1988,11 @@ func (fs *fileStore) recoverMsgs() error {
 	<-dios
 	pdir := filepath.Join(fs.fcfg.StoreDir, purgeDir)
 	if _, err := os.Stat(pdir); err == nil {
-		err = os.RemoveAll(pdir)
 		if err != nil {
+			log.Printf("OHDBG: error calling os.Stat(pdir) in recoverMsgs, err=[%s]", err)
+		}
+		otherErr := os.RemoveAll(pdir)
+		if otherErr != nil {
 			log.Printf("OHDBG: error calling os.RemoveAll(pdir) in recoverMsgs, err=[%s]", err)
 		}
 	}
@@ -8746,7 +8752,13 @@ func (o *consumerFileStore) writeState(buf []byte) error {
 	// Lock not held here but we do limit number of outstanding calls that could block OS threads.
 	<-dios
 	err := os.WriteFile(ifn, buf, defaultFilePerms)
+	if err != nil {
+		log.Printf("OHDBG: bonus log in case channel gets blocked in writeState, attempting to use os.WriteFile(ifn, buf, defaultFilePerms), err=[%s]", err)
+	}
 	dios <- struct{}{}
+	if err != nil {
+		log.Printf("OHDBG: bonus log got past the chan block in writeState, err=[%s]", err)
+	}
 
 	o.mu.Lock()
 	if err != nil {
