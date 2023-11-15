@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"log"
 	"math"
 	"net"
 	"os"
@@ -376,9 +377,15 @@ func newFileStoreWithCreated(fcfg FileStoreConfig, cfg StreamConfig, created tim
 		return nil, fmt.Errorf("storage directory is not writable")
 	}
 
-	tmpfile.Close()
+	err = tmpfile.Close()
+	if err != nil {
+		log.Printf("OHDBG: error calling tmpfile.Close() in newFileStoreWithCreated, err=[%s]", err)
+	}
 	<-dios
-	os.Remove(tmpfile.Name())
+	err = os.Remove(tmpfile.Name())
+	if err != nil {
+		log.Printf("OHDBG: error calling os.Remove(tmpfile.Name()) in newFileStoreWithCreated, err=[%s]", err)
+	}
 	dios <- struct{}{}
 
 	fs := &fileStore{
@@ -443,7 +450,10 @@ func newFileStoreWithCreated(fcfg FileStoreConfig, cfg StreamConfig, created tim
 		if fs.ld != nil && prior.LastSeq > fs.state.LastSeq {
 			fs.state.LastSeq, fs.state.LastTime = prior.LastSeq, prior.LastTime
 			if lmb, err := fs.newMsgBlockForWrite(); err == nil {
-				lmb.writeTombstone(prior.LastSeq, prior.LastTime.UnixNano())
+				err = lmb.writeTombstone(prior.LastSeq, prior.LastTime.UnixNano())
+				if err != nil {
+					log.Printf("OHDBG: error calling lmb.writeTombstone(prior.LastSeq, prior.LastTime.UnixNano()) in newFileStoreWithCreated, err=[%s]", err)
+				}
 			} else {
 				return nil, err
 			}
@@ -465,7 +475,10 @@ func newFileStoreWithCreated(fcfg FileStoreConfig, cfg StreamConfig, created tim
 	// Check if we have any left over tombstones to process.
 	if len(fs.tombs) > 0 {
 		for _, seq := range fs.tombs {
-			fs.removeMsg(seq, false, true, false)
+			somebool, err := fs.removeMsg(seq, false, true, false)
+			if err != nil {
+				log.Printf("OHDBG: error calling fs.removeMsg(seq, false, true, false) in newFileStoreWithCreated, boolean return=[%v] err=[%s]", somebool, err)
+			}
 			fs.removeFromLostData(seq)
 		}
 		// Not needed after this phase.
@@ -682,7 +695,10 @@ func (fs *fileStore) genEncryptionKeys(context string) (aek cipher.AEAD, bek cip
 
 	// Generate our nonce. Use same buffer to hold encrypted seed.
 	nonce := make([]byte, kek.NonceSize(), kek.NonceSize()+len(seed)+kek.Overhead())
-	rand.Read(nonce)
+	_, err = rand.Read(nonce)
+	if err != nil {
+		log.Printf("OHDBG: error calling rand.Read(nonce) in genEncryptionKeys, err=[%s]", err)
+	}
 
 	bek, err = genBlockEncryptionKey(sc, seed[:], nonce)
 	if err != nil {
@@ -773,7 +789,10 @@ func (fs *fileStore) writeStreamMeta() error {
 	// Encrypt if needed.
 	if fs.aek != nil {
 		nonce := make([]byte, fs.aek.NonceSize(), fs.aek.NonceSize()+len(b)+fs.aek.Overhead())
-		rand.Read(nonce)
+		_, err = rand.Read(nonce)
+		if err != nil {
+			log.Printf("OHDBG: error calling rand.Read(nonce) in writeStreamMeta, err=[%s]", err)
+		}
 		b = fs.aek.Seal(nonce, nonce, b, nil)
 	}
 
@@ -781,7 +800,10 @@ func (fs *fileStore) writeStreamMeta() error {
 		return err
 	}
 	fs.hh.Reset()
-	fs.hh.Write(b)
+	_, err = fs.hh.Write(b)
+	if err != nil {
+		log.Printf("OHDBG: error calling fs.hh.Write(b) in writeStreamMeta, err=[%s]", err)
+	}
 	checksum := hex.EncodeToString(fs.hh.Sum(nil))
 	sum := filepath.Join(fs.fcfg.StoreDir, JetStreamMetaFileSum)
 	if err := os.WriteFile(sum, []byte(checksum), defaultFilePerms); err != nil {
@@ -860,8 +882,12 @@ func (fs *fileStore) initMsgBlock(index uint32) *msgBlock {
 	mb.mfn = filepath.Join(mdir, fmt.Sprintf(blkScan, index))
 
 	if mb.hh == nil {
+		var err error
 		key := sha256.Sum256(fs.hashKeyForBlock(index))
-		mb.hh, _ = highwayhash.New64(key[:])
+		mb.hh, err = highwayhash.New64(key[:])
+		if err != nil {
+			log.Printf("OHDBG: error calling highwayhash.New64(key[:]) in initMsgBlock, err=[%s]", err)
+		}
 	}
 	return mb
 }
@@ -956,7 +982,12 @@ func (fs *fileStore) recoverMsgBlock(index uint32) (*msgBlock, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
+	defer func() {
+		err = file.Close()
+		if err != nil {
+			log.Printf("OHDBG: error calling defer file.Close() in recoverMsgBlock, err=[%s]", err)
+		}
+	}()
 
 	if fi, err := file.Stat(); fi != nil {
 		mb.rbytes = uint64(fi.Size())
@@ -965,22 +996,34 @@ func (fs *fileStore) recoverMsgBlock(index uint32) (*msgBlock, error) {
 	}
 
 	// Make sure encryption loaded if needed.
-	fs.loadEncryptionForMsgBlock(mb)
+	err = fs.loadEncryptionForMsgBlock(mb)
+	if err != nil {
+		log.Printf("OHDBG: error calling loadEncryptionForMsgBlock in recoverMsgBlock, err=[%s]", err)
+	}
 
 	// Grab last checksum from main block file.
 	var lchk [8]byte
 	if mb.rbytes >= checksumSize {
 		if mb.bek != nil {
-			if buf, _ := mb.loadBlock(nil); len(buf) >= checksumSize {
+			if buf, err := mb.loadBlock(nil); len(buf) >= checksumSize {
+				if err != nil {
+					log.Printf("OHDBG: error calling mb.loadBlock(nil) in recoverMsgBlock, err=[%s]", err)
+				}
 				mb.bek.XORKeyStream(buf, buf)
 				copy(lchk[0:], buf[len(buf)-checksumSize:])
 			}
 		} else {
-			file.ReadAt(lchk[:], int64(mb.rbytes)-checksumSize)
+			_, err = file.ReadAt(lchk[:], int64(mb.rbytes)-checksumSize)
+			if err != nil {
+				log.Printf("OHDBG: error calling file.ReadAt(lchk[:], int64(mb.rbytes)-checksumSize) in recoverMsgBlock, err=[%s]", err)
+			}
 		}
 	}
 
-	file.Close()
+	err = file.Close()
+	if err != nil {
+		log.Printf("OHDBG: error calling file.Close() in recoverMsgBlock, err=[%s]", err)
+	}
 
 	// Read our index file. Use this as source of truth if possible.
 	if err := mb.readIndexInfo(); err == nil {
@@ -998,7 +1041,10 @@ func (fs *fileStore) recoverMsgBlock(index uint32) (*msgBlock, error) {
 	}
 
 	// If we get data loss rebuilding the message block state record that with the fs itself.
-	ld, tombs, _ := mb.rebuildState()
+	ld, tombs, err := mb.rebuildState()
+	if err != nil {
+		log.Printf("OHDBG: error calling mb.rebuildState() in recoverMsgBlock, err=[%s]", err)
+	}
 	if ld != nil {
 		fs.addLostData(ld)
 	}
@@ -1013,7 +1059,12 @@ func (fs *fileStore) recoverMsgBlock(index uint32) (*msgBlock, error) {
 		mb.tryForceExpireCacheLocked()
 	}
 
-	mb.closeFDs()
+	err = mb.closeFDs()
+	if err != nil {
+		log.Printf("OHDBG: error calling mb.closeFDs() in recoverMsgBlock, err=[%s]", err)
+		// Should probably return nil, err here, but for the sake of testing leaving it
+	}
+
 	fs.addMsgBlock(mb)
 
 	return mb, nil
@@ -1163,7 +1214,12 @@ func (mb *msgBlock) convertCipher() error {
 			return err
 		}
 
-		buf, _ := mb.loadBlock(nil)
+		buf, err := mb.loadBlock(nil)
+		if err != nil {
+			log.Printf("OHDBG: error calling mb.loadBlock(nil) in convertCipher, err=[%s]", err)
+
+		}
+
 		bek.XORKeyStream(buf, buf)
 		// Make sure we can parse with old cipher and key file.
 		if err = mb.indexCacheBuf(buf); err != nil {
@@ -1176,7 +1232,11 @@ func (mb *msgBlock) convertCipher() error {
 		// the old keyfile back.
 		if err := fs.genEncryptionKeysForBlock(mb); err != nil {
 			keyFile := filepath.Join(mdir, fmt.Sprintf(keyScan, mb.index))
-			os.WriteFile(keyFile, ekey, defaultFilePerms)
+			err = os.WriteFile(keyFile, ekey, defaultFilePerms)
+			if err != nil {
+				log.Printf("OHDBG: error calling os.WriteFile(keyFile, ekey, defaultFilePerms) in convertCipher, err=[%s]", err)
+
+			}
 			return err
 		}
 		mb.bek.XORKeyStream(buf, buf)
@@ -1289,7 +1349,12 @@ func (mb *msgBlock) rebuildStateLocked() (*LostStreamData, []uint64, error) {
 		} else {
 			fd, err = os.OpenFile(mb.mfn, os.O_RDWR, defaultFilePerms)
 			if err == nil {
-				defer fd.Close()
+				defer func() {
+					err = fd.Close()
+					if err != nil {
+						log.Printf("OHDBG: error calling fd.Close() in rebuildStateLocked, err=[%s]", err)
+					}
+				}()
 			}
 		}
 		if fd == nil {
@@ -1299,10 +1364,16 @@ func (mb *msgBlock) rebuildStateLocked() (*LostStreamData, []uint64, error) {
 			// Update our checksum.
 			if index >= 8 {
 				var lchk [8]byte
-				fd.ReadAt(lchk[:], int64(index-8))
+				_, err = fd.ReadAt(lchk[:], int64(index-8))
+				if err != nil {
+					log.Printf("OHDBG: error calling fd.ReadAt(lchk[:], int64(index-8)) in rebuildStateLocked, err=[%s]", err)
+				}
 				copy(mb.lchk[0:], lchk[:])
 			}
-			fd.Sync()
+			err = fd.Sync()
+			if err != nil {
+				log.Printf("OHDBG: error calling fd.Sync() in rebuildStateLocked, err=[%s]", err)
+			}
 		}
 	}
 
@@ -1345,12 +1416,24 @@ func (mb *msgBlock) rebuildStateLocked() (*LostStreamData, []uint64, error) {
 		data := buf[index+msgHdrSize : index+rl]
 		if hh := mb.hh; hh != nil {
 			hh.Reset()
-			hh.Write(hdr[4:20])
-			hh.Write(data[:slen])
+			_, err = hh.Write(hdr[4:20])
+			if err != nil {
+				log.Printf("OHDBG: error calling hh.Write(hdr[4:20]) in rebuildStateLocked, err=[%s]", err)
+			}
+			_, err = hh.Write(data[:slen])
+			if err != nil {
+				log.Printf("OHDBG: error calling hh.Write(data[:slen]) in rebuildStateLocked, err=[%s]", err)
+			}
 			if hasHeaders {
-				hh.Write(data[slen+4 : dlen-recordHashSize])
+				_, err = hh.Write(data[slen+4 : dlen-recordHashSize])
+				if err != nil {
+					log.Printf("OHDBG: error calling hh.Write(data[slen+4 : dlen-recordHashSize]) in rebuildStateLocked, err=[%s]", err)
+				}
 			} else {
-				hh.Write(data[slen : dlen-recordHashSize])
+				_, err = hh.Write(data[slen : dlen-recordHashSize])
+				if err != nil {
+					log.Printf("OHDBG: error calling hh.Write(data[slen : dlen-recordHashSize]) in rebuildStateLocked, err=[%s]", err)
+				}
 			}
 			checksum := hh.Sum(nil)
 			if !bytes.Equal(checksum, data[len(data)-recordHashSize:]) {
@@ -1474,12 +1557,18 @@ func (fs *fileStore) recoverFullState() (rerr error) {
 	<-dios
 	pdir := filepath.Join(fs.fcfg.StoreDir, purgeDir)
 	if _, err := os.Stat(pdir); err == nil {
-		os.RemoveAll(pdir)
+		err = os.RemoveAll(pdir)
+		if err != nil {
+			log.Printf("OHDBG: error calling os.RemoveAll(pdir) in recoverFullState, err=[%s]", err)
+		}
 	}
 
 	// Grab our stream state file and load it in.
 	fn := filepath.Join(fs.fcfg.StoreDir, msgDir, streamStreamStateFile)
 	buf, err := os.ReadFile(fn)
+	if err != nil {
+		log.Printf("OHDBG: bonus log in case channel gets blocked in recoverFullState, should be followed by \"Could not read stream state file\", err=[%s]", err)
+	}
 	dios <- struct{}{}
 
 	if err != nil {
@@ -1491,7 +1580,10 @@ func (fs *fileStore) recoverFullState() (rerr error) {
 
 	const minLen = 32
 	if len(buf) < minLen {
-		os.Remove(fn)
+		err = os.Remove(fn)
+		if err != nil {
+			log.Printf("OHDBG: error calling os.Remove(fn) in recoverFullState, err=[%s]", err)
+		}
 		fs.warn("Stream state too short (%d bytes)", len(buf))
 		return errCorruptState
 	}
@@ -1500,9 +1592,15 @@ func (fs *fileStore) recoverFullState() (rerr error) {
 	h := buf[len(buf)-highwayhash.Size64:]
 	buf = buf[:len(buf)-highwayhash.Size64]
 	fs.hh.Reset()
-	fs.hh.Write(buf)
+	_, err = fs.hh.Write(buf)
+	if err != nil {
+		log.Printf("OHDBG: error calling fs.hh.Write(buf) in recoverFullState, err=[%s]", err)
+	}
 	if !bytes.Equal(h, fs.hh.Sum(nil)) {
-		os.Remove(fn)
+		err = os.Remove(fn)
+		if err != nil {
+			log.Printf("OHDBG: error calling os.Remove(fn) (the first one) in recoverFullState, err=[%s]", err)
+		}
 		fs.warn("Stream state checksum did not match")
 		return errCorruptState
 	}
@@ -1522,7 +1620,10 @@ func (fs *fileStore) recoverFullState() (rerr error) {
 	}
 
 	if buf[0] != fullStateMagic || buf[1] != fullStateVersion {
-		os.Remove(fn)
+		err = os.Remove(fn)
+		if err != nil {
+			log.Printf("OHDBG: error calling os.Remove(fn) (the second one) in recoverFullState, err=[%s]", err)
+		}
 		fs.warn("Stream state magic and version mismatch")
 		return errCorruptState
 	}
@@ -1577,7 +1678,10 @@ func (fs *fileStore) recoverFullState() (rerr error) {
 		for i := 0; i < numSubjects; i++ {
 			if lsubj := int(readU64()); lsubj > 0 {
 				if bi+lsubj > len(buf) {
-					os.Remove(fn)
+					err = os.Remove(fn)
+					if err != nil {
+						log.Printf("OHDBG: error calling os.Remove(fn) (the third one) in recoverFullState, err=[%s]", err)
+					}
 					fs.warn("Stream state bad subject len (%d)", lsubj)
 					return errCorruptState
 				}
@@ -1611,7 +1715,10 @@ func (fs *fileStore) recoverFullState() (rerr error) {
 			if numDeleted > 0 {
 				dmap, n, err := avl.Decode(buf[bi:])
 				if err != nil {
-					os.Remove(fn)
+					err = os.Remove(fn)
+					if err != nil {
+						log.Printf("OHDBG: error calling os.Remove(fn) (the fourth one) in recoverFullState, err=[%s]", err)
+					}
 					fs.warn("Stream state error decoding avl dmap: %v", err)
 					return errCorruptState
 				}
@@ -1644,7 +1751,10 @@ func (fs *fileStore) recoverFullState() (rerr error) {
 
 	// Check if we had any errors.
 	if bi < 0 {
-		os.Remove(fn)
+		err = os.Remove(fn)
+		if err != nil {
+			log.Printf("OHDBG: error calling os.Remove(fn) (the fifth one) in recoverFullState, err=[%s]", err)
+		}
 		fs.warn("Stream state has no checksum present")
 		return errCorruptState
 	}
@@ -1662,7 +1772,10 @@ func (fs *fileStore) recoverFullState() (rerr error) {
 	}
 	if _, err := os.Stat(mb.mfn); err != nil && os.IsNotExist(err) {
 		// If our saved state is past what we see on disk, fallback and rebuild.
-		if ld, _, _ := mb.rebuildState(); ld != nil {
+		if ld, _, err := mb.rebuildState(); ld != nil {
+			if err != nil {
+				log.Printf("OHDBG: error calling mb.rebuildState() in recoverFullState, err=[%s]", err)
+			}
 			fs.addLostData(ld)
 		}
 		fs.warn("Stream state detected prior state, could not locate msg block %d", blkIndex)
@@ -1672,7 +1785,10 @@ func (fs *fileStore) recoverFullState() (rerr error) {
 		// Remove the last message block since recover will add in the new one.
 		fs.removeMsgBlockFromList(mb)
 		if nmb, err := fs.recoverMsgBlockNoSubjectUpdates(mb.index); err != nil && !os.IsNotExist(err) {
-			os.Remove(fn)
+			err = os.Remove(fn)
+			if err != nil {
+				log.Printf("OHDBG: error calling os.Remove(fn) (the sixth one) in recoverFullState, err=[%s]", err)
+			}
 			return errCorruptState
 		} else if nmb != nil {
 			fs.adjustAccounting(mb, nmb)
@@ -1686,7 +1802,10 @@ func (fs *fileStore) recoverFullState() (rerr error) {
 			if os.IsNotExist(err) {
 				return nil
 			}
-			os.Remove(fn)
+			err = os.Remove(fn)
+			if err != nil {
+				log.Printf("OHDBG: error calling os.Remove(fn) (the seventh one) in recoverFullState, err=[%s]", err)
+			}
 			fs.warn("Stream state could not recover msg block %d", bi)
 			return err
 		}
@@ -1710,14 +1829,21 @@ func (fs *fileStore) recoverFullState() (rerr error) {
 // within a message block, e.g. additional records were added after the stream state.
 // Lock should be held.
 func (fs *fileStore) adjustAccounting(mb, nmb *msgBlock) {
+	var err error
 	nmb.mu.Lock()
 	defer nmb.mu.Unlock()
 
 	// First make sure the new block is loaded.
 	if nmb.cacheNotLoaded() {
-		nmb.loadMsgsWithLock()
+		err = nmb.loadMsgsWithLock()
+		if err != nil {
+			log.Printf("OHDBG: error calling nmb.loadMsgsWithLock() in adjustAccounting, err=[%s]", err)
+		}
 	}
-	nmb.ensurePerSubjectInfoLoaded()
+	err = nmb.ensurePerSubjectInfoLoaded()
+	if err != nil {
+		log.Printf("OHDBG: error calling nmb.ensurePerSubjectInfoLoaded() in adjustAccounting, err=[%s]", err)
+	}
 
 	// Walk only new messages and update accounting at fs level. Any messages that should have
 	// triggered limits exceeded will be handled after the recovery and prior to the stream
@@ -1727,6 +1853,7 @@ func (fs *fileStore) adjustAccounting(mb, nmb *msgBlock) {
 		// Lookup the message. If an error will be deleted, so can skip.
 		sm, err := nmb.cacheLookup(seq, &smv)
 		if err != nil {
+			log.Printf("OHDBG: bonus log calling nmb.cacheLookup(seq, &smv) in adjustAccounting, err=[%s]", err)
 			continue
 		}
 		// Since we found it we just need to adjust fs totals and psim.
@@ -1769,10 +1896,18 @@ func (mb *msgBlock) lastChecksum() []byte {
 	if err != nil {
 		return nil
 	}
-	defer f.Close()
+	defer func() {
+		err = f.Close()
+		if err != nil {
+			log.Printf("OHDBG: error calling f.Close() in lastChecksum, err=[%s]", err)
+		}
+	}()
 
 	var lchk [8]byte
-	if fi, _ := f.Stat(); fi != nil {
+	if fi, err := f.Stat(); fi != nil {
+		if err != nil {
+			log.Printf("OHDBG: error calling f.Stat() in lastChecksum, err=[%s]", err)
+		}
 		mb.rbytes = uint64(fi.Size())
 	}
 	if mb.rbytes < checksumSize {
@@ -1786,7 +1921,10 @@ func (mb *msgBlock) lastChecksum() []byte {
 		}
 	}
 	if mb.bek != nil {
-		if buf, _ := mb.loadBlock(nil); len(buf) >= checksumSize {
+		if buf, err := mb.loadBlock(nil); len(buf) >= checksumSize {
+			if err != nil {
+				log.Printf("OHDBG: error calling mb.loadBlock(nil) in lastChecksum, err=[%s]", err)
+			}
 			bek, err := genBlockEncryptionKey(mb.fs.fcfg.Cipher, mb.seed, mb.nonce)
 			if err != nil {
 				return nil
@@ -1796,7 +1934,10 @@ func (mb *msgBlock) lastChecksum() []byte {
 			copy(lchk[0:], buf[len(buf)-checksumSize:])
 		}
 	} else {
-		f.ReadAt(lchk[:], int64(mb.rbytes)-checksumSize)
+		_, err = f.ReadAt(lchk[:], int64(mb.rbytes)-checksumSize)
+		if err != nil {
+			log.Printf("OHDBG: error calling f.ReadAt(lchk[:], int64(mb.rbytes)-checksumSize) in lastChecksum, err=[%s]", err)
+		}
 	}
 	return lchk[:]
 }
@@ -1812,8 +1953,14 @@ func (fs *fileStore) cleanupOldMeta() {
 		return
 	}
 
-	dirs, _ := f.ReadDir(-1)
-	f.Close()
+	dirs, err := f.ReadDir(-1)
+	if err != nil {
+		log.Printf("OHDBG: error calling f.ReadDir(-1) in cleanupOldMeta, err=[%s]", err)
+	}
+	err = f.Close()
+	if err != nil {
+		log.Printf("OHDBG: error calling f.Close() in cleanupOldMeta, err=[%s]", err)
+	}
 
 	const (
 		minLen    = 4
@@ -1822,7 +1969,10 @@ func (fs *fileStore) cleanupOldMeta() {
 	)
 	for _, fi := range dirs {
 		if name := fi.Name(); strings.HasSuffix(name, idxSuffix) || strings.HasSuffix(name, fssSuffix) {
-			os.Remove(filepath.Join(mdir, name))
+			err = os.Remove(filepath.Join(mdir, name))
+			if err != nil {
+				log.Printf("OHDBG: error calling os.Remove(filepath.Join(mdir, name)) in cleanupOldMeta, err=[%s]", err)
+			}
 		}
 	}
 }
@@ -1835,7 +1985,10 @@ func (fs *fileStore) recoverMsgs() error {
 	<-dios
 	pdir := filepath.Join(fs.fcfg.StoreDir, purgeDir)
 	if _, err := os.Stat(pdir); err == nil {
-		os.RemoveAll(pdir)
+		err = os.RemoveAll(pdir)
+		if err != nil {
+			log.Printf("OHDBG: error calling os.RemoveAll(pdir) in recoverMsgs, err=[%s]", err)
+		}
 	}
 	mdir := filepath.Join(fs.fcfg.StoreDir, msgDir)
 	f, err := os.Open(mdir)
@@ -1844,7 +1997,10 @@ func (fs *fileStore) recoverMsgs() error {
 		return errNotReadable
 	}
 	dirs, err := f.ReadDir(-1)
-	f.Close()
+	othererr := f.Close()
+	if othererr != nil {
+		log.Printf("OHDBG: error calling f.Close() in recoverMsgs, err=[%s]", err)
+	}
 	dios <- struct{}{}
 
 	if err != nil {
@@ -1933,7 +2089,10 @@ func (fs *fileStore) recoverMsgs() error {
 				shouldRemove = false
 			}
 			if shouldRemove {
-				os.Remove(fn)
+				err = os.Remove(fn)
+				if err != nil {
+					log.Printf("OHDBG: error calling os.Remove(fn) in recoverMsgs, err=[%s]", err)
+				}
 			}
 		}
 	}
@@ -1967,7 +2126,10 @@ func (fs *fileStore) expireMsgsOnRecover() {
 			last.ts = mb.last.ts
 		}
 		// Make sure we do subject cleanup as well.
-		mb.ensurePerSubjectInfoLoaded()
+		err := mb.ensurePerSubjectInfoLoaded()
+		if err != nil {
+			log.Printf("OHDBG: error calling mb.ensurePerSubjectInfoLoaded() (first one) in expireMsgsOnRecover, err=[%s]", err)
+		}
 		for subj, ss := range mb.fss {
 			for i := uint64(0); i < ss.Msgs; i++ {
 				fs.removePerSubject(subj)
@@ -2003,7 +2165,10 @@ func (fs *fileStore) expireMsgsOnRecover() {
 		var needNextFirst bool
 
 		// Walk messages and remove if expired.
-		mb.ensurePerSubjectInfoLoaded()
+		err := mb.ensurePerSubjectInfoLoaded()
+		if err != nil {
+			log.Printf("OHDBG: error calling mb.ensurePerSubjectInfoLoaded() (second one) in expireMsgsOnRecover, err=[%s]", err)
+		}
 		fseq, lseq := atomic.LoadUint64(&mb.first.seq), atomic.LoadUint64(&mb.last.seq)
 		for seq := fseq; seq <= lseq; seq++ {
 			sm, err := mb.cacheLookup(seq, &smv)
@@ -2102,8 +2267,14 @@ func (fs *fileStore) expireMsgsOnRecover() {
 
 	// Check if we have no messages and blocks left.
 	if fs.lmb == nil && last.seq != 0 {
-		if lmb, _ := fs.newMsgBlockForWrite(); lmb != nil {
-			lmb.writeTombstone(last.seq, last.ts)
+		if lmb, err := fs.newMsgBlockForWrite(); lmb != nil {
+			if err != nil {
+				log.Printf("OHDBG: error calling fs.newMsgBlockForWrite() in expireMsgsOnRecover, err=[%s]", err)
+			}
+			err := lmb.writeTombstone(last.seq, last.ts)
+			if err != nil {
+				log.Printf("OHDBG: error calling lmb.writeTombstone(last.seq, last.ts) in expireMsgsOnRecover, err=[%s]", err)
+			}
 		}
 		// Clear any global subject state.
 		fs.psim, fs.tsl = make(map[string]*psi), 0
@@ -2151,7 +2322,10 @@ func (fs *fileStore) GetSeqFromTime(t time.Time) uint64 {
 	// Linear search, hence the dumb part..
 	ts := t.UnixNano()
 	for seq := fseq; seq <= lseq; seq++ {
-		sm, _, _ := mb.fetchMsg(seq, &smv)
+		sm, _, err := mb.fetchMsg(seq, &smv)
+		if err != nil {
+			log.Printf("OHDBG: error calling mb.fetchMsg(seq, &smv) in GetSeqFromTime, err=[%s]", err)
+		}
 		if sm != nil && sm.ts >= ts {
 			return sm.seq
 		}
@@ -2285,7 +2459,10 @@ func (mb *msgBlock) filteredPendingLocked(filter string, wc bool, sseq uint64) (
 	}
 
 	// Make sure we have fss loaded.
-	mb.ensurePerSubjectInfoLoaded()
+	err := mb.ensurePerSubjectInfoLoaded()
+	if err != nil {
+		log.Printf("OHDBG: error calling  mb.ensurePerSubjectInfoLoaded() in filteredPendingLocked, err=[%s]", err)
+	}
 
 	tsa := [32]string{}
 	fsa := [32]string{}
@@ -2331,13 +2508,19 @@ func (mb *msgBlock) filteredPendingLocked(filter string, wc bool, sseq uint64) (
 	// If we load the cache for a linear scan we want to expire that cache upon exit.
 	var shouldExpire bool
 	if mb.cacheNotLoaded() {
-		mb.loadMsgsWithLock()
+		err = mb.loadMsgsWithLock()
+		if err != nil {
+			log.Printf("OHDBG: error calling mb.loadMsgsWithLock() in filteredPendingLocked, err=[%s]", err)
+		}
 		shouldExpire = true
 	}
 
 	var smv StoreMsg
 	for seq, lseq := sseq, atomic.LoadUint64(&mb.last.seq); seq <= lseq; seq++ {
-		sm, _ := mb.cacheLookup(seq, &smv)
+		sm, err := mb.cacheLookup(seq, &smv)
+		if err != nil {
+			log.Printf("OHDBG: error calling mb.cacheLookup(seq, &smv) in filteredPendingLocked, err=[%s]", err)
+		}
 		if sm == nil {
 			continue
 		}
@@ -2505,7 +2688,10 @@ func (fs *fileStore) SubjectsState(subject string) map[string]SimpleState {
 		var shouldExpire bool
 		if mb.fss == nil {
 			// Make sure we have fss loaded.
-			mb.loadMsgsWithLock()
+			err := mb.loadMsgsWithLock()
+			if err != nil {
+				log.Printf("OHDBG: error calling mb.loadMsgsWithLock() in SubjectsState, err=[%s]", err)
+			}
 			shouldExpire = true
 		}
 		for subj, ss := range mb.fss {
@@ -2605,7 +2791,10 @@ func (fs *fileStore) NumPending(sseq uint64, filter string, lastPerSubject bool)
 			var t uint64
 			if isAll && sseq <= atomic.LoadUint64(&mb.first.seq) {
 				if lastPerSubject {
-					mb.ensurePerSubjectInfoLoaded()
+					err := mb.ensurePerSubjectInfoLoaded()
+					if err != nil {
+						log.Printf("OHDBG: error calling mb.ensurePerSubjectInfoLoaded() (first one) in NumPending, err=[%s]", err)
+					}
 					for subj := range mb.fss {
 						if !seen[subj] {
 							total++
@@ -2621,7 +2810,10 @@ func (fs *fileStore) NumPending(sseq uint64, filter string, lastPerSubject bool)
 
 			// If we are here we need to at least scan the subject fss.
 			// Make sure we have fss loaded.
-			mb.ensurePerSubjectInfoLoaded()
+			err := mb.ensurePerSubjectInfoLoaded()
+			if err != nil {
+				log.Printf("OHDBG: error calling mb.ensurePerSubjectInfoLoaded() (second one) in NumPending, err=[%s]", err)
+			}
 			var havePartial bool
 			for subj, ss := range mb.fss {
 				if !seen[subj] && isMatch(subj) {
@@ -2652,12 +2844,18 @@ func (fs *fileStore) NumPending(sseq uint64, filter string, lastPerSubject bool)
 				// If we load the cache for a linear scan we want to expire that cache upon exit.
 				var shouldExpire bool
 				if mb.cacheNotLoaded() {
-					mb.loadMsgsWithLock()
+					err = mb.loadMsgsWithLock()
+					if err != nil {
+						log.Printf("OHDBG: error calling mb.loadMsgsWithLock() in NumPending, err=[%s]", err)
+					}
 					shouldExpire = true
 				}
 				var smv StoreMsg
 				for seq, lseq := sseq, atomic.LoadUint64(&mb.last.seq); seq <= lseq; seq++ {
-					if sm, _ := mb.cacheLookup(seq, &smv); sm != nil && (isAll || isMatch(sm.subj)) {
+					if sm, err := mb.cacheLookup(seq, &smv); sm != nil && (isAll || isMatch(sm.subj)) {
+						if err != nil {
+							log.Printf("OHDBG: error calling mb.cacheLookup(seq, &smv) in NumPending, err=[%s]", err)
+						}
 						t++
 					}
 				}
@@ -2735,7 +2933,10 @@ func (fs *fileStore) NumPending(sseq uint64, filter string, lastPerSubject bool)
 				// We need to adjust for all matches in this block.
 				// We will scan fss state vs messages themselves.
 				// Make sure we have fss loaded.
-				mb.ensurePerSubjectInfoLoaded()
+				err := mb.ensurePerSubjectInfoLoaded()
+				if err != nil {
+					log.Printf("OHDBG: error calling mb.ensurePerSubjectInfoLoaded() in NumPending, err=[%s]", err)
+				}
 				for subj, ss := range mb.fss {
 					if isMatch(subj) {
 						if lastPerSubject {
@@ -2761,7 +2962,10 @@ func (fs *fileStore) NumPending(sseq uint64, filter string, lastPerSubject bool)
 				last = sseq
 			}
 			for seq := atomic.LoadUint64(&mb.first.seq); seq < last; seq++ {
-				sm, _ := mb.cacheLookup(seq, &smv)
+				sm, err := mb.cacheLookup(seq, &smv)
+				if err != nil {
+					log.Printf("OHDBG: error calling mb.cacheLookup(seq, &smv) in NumPending, err=[%s]", err)
+				}
 				if sm == nil {
 					continue
 				}
@@ -2844,10 +3048,17 @@ func (mb *msgBlock) setupWriteCache(buf []byte) {
 	mb.cache = &cache{buf: buf}
 	// Make sure we set the proper cache offset if we have existing data.
 	var fi os.FileInfo
+	var err error
 	if mb.mfd != nil {
-		fi, _ = mb.mfd.Stat()
+		fi, err = mb.mfd.Stat()
+		if err != nil {
+			log.Printf("OHDBG: error calling mb.mfd.Stat() in setupWriteCache, err=[%s]", err)
+		}
 	} else if mb.mfn != _EMPTY_ {
-		fi, _ = os.Stat(mb.mfn)
+		fi, err = os.Stat(mb.mfn)
+		if err != nil {
+			log.Printf("OHDBG: error calling os.Stat(mb.mfn) in setupWriteCache, err=[%s]", err)
+		}
 	}
 	if fi != nil {
 		mb.cache.off = int(fi.Size())
@@ -2868,7 +3079,10 @@ func (fs *fileStore) newMsgBlockForWrite() (*msgBlock, error) {
 		// Determine if we can reclaim any resources here.
 		if fs.fip {
 			lmb.mu.Lock()
-			lmb.closeFDsLocked()
+			err := lmb.closeFDsLocked()
+			if err != nil {
+				log.Printf("OHDBG: error calling lmb.closeFDsLocked() in newMsgBlockForWrite, err=[%s]", err)
+			}
 			if lmb.cache != nil {
 				// Reset write timestamp and see if we can expire this cache.
 				rbuf = lmb.tryExpireWriteCache()
@@ -3039,14 +3253,26 @@ func (fs *fileStore) storeRawMsg(subj string, hdr, msg []byte, seq uint64, ts in
 	if psmax && psmc >= mmp {
 		// We may have done this above.
 		if fseq == 0 {
-			fseq, _ = fs.firstSeqForSubj(subj)
+			fseq, err = fs.firstSeqForSubj(subj)
+			if err != nil {
+				log.Printf("OHDBG: error calling fs.firstSeqForSubj(subj) in storeRawMsg, err=[%s]", err)
+			}
 		}
-		if ok, _ := fs.removeMsgViaLimits(fseq); ok {
+		if ok, err := fs.removeMsgViaLimits(fseq); ok {
+			if err != nil {
+				log.Printf("OHDBG: error calling fs.removeMsgViaLimits(fseq) in storeRawMsg, err=[%s]", err)
+			}
 			// Make sure we are below the limit.
 			if psmc--; psmc >= mmp {
 				for info, ok := fs.psim[subj]; ok && info.total > mmp; info, ok = fs.psim[subj] {
-					if seq, _ := fs.firstSeqForSubj(subj); seq > 0 {
-						if ok, _ := fs.removeMsgViaLimits(seq); !ok {
+					if seq, err := fs.firstSeqForSubj(subj); seq > 0 {
+						if err != nil {
+							log.Printf("OHDBG: error calling fs.firstSeqForSubj(subj) in storeRawMsg, err=[%s]", err)
+						}
+						if ok, err := fs.removeMsgViaLimits(seq); !ok {
+							if err != nil {
+								log.Printf("OHDBG: error calling fs.removeMsgViaLimits(seq) in storeRawMsg, err=[%s]", err)
+							}
 							break
 						}
 					} else {
@@ -3057,7 +3283,10 @@ func (fs *fileStore) storeRawMsg(subj string, hdr, msg []byte, seq uint64, ts in
 		} else if mb := fs.selectMsgBlock(fseq); mb != nil {
 			// If we are here we could not remove fseq from above, so rebuild.
 			var ld *LostStreamData
-			if ld, _, _ = mb.rebuildState(); ld != nil {
+			if ld, _, err = mb.rebuildState(); ld != nil {
+				if err != nil {
+					log.Printf("OHDBG: error calling mb.rebuildState() in storeRawMsg, err=[%s]", err)
+				}
 				fs.rebuildStateLocked(ld)
 			}
 		}
@@ -3143,7 +3372,10 @@ func (mb *msgBlock) skipMsg(seq uint64, now time.Time) {
 	mb.mu.Unlock()
 
 	if needsRecord {
-		mb.writeMsgRecord(emptyRecordLen, seq|ebit, _EMPTY_, nil, nil, nowts, true)
+		err := mb.writeMsgRecord(emptyRecordLen, seq|ebit, _EMPTY_, nil, nil, nowts, true)
+		if err != nil {
+			log.Printf("OHDBG: error calling mb.writeMsgRecord(emptyRecordLen, seq|ebit, _EMPTY_, nil, nil, nowts, true) in skipMsg, err=[%s]", err)
+		}
 	} else {
 		mb.kickFlusher()
 	}
@@ -3178,7 +3410,10 @@ func (fs *fileStore) rebuildFirst() {
 		return
 	}
 
-	ld, _, _ := fmb.rebuildState()
+	ld, _, err := fmb.rebuildState()
+	if err != nil {
+		log.Printf("OHDBG: error calling fmb.rebuildState() in skipMsg, err=[%s]", err)
+	}
 	fmb.mu.RLock()
 	isEmpty := fmb.msgs == 0
 	fmb.mu.RUnlock()
@@ -3330,9 +3565,15 @@ func (fs *fileStore) enforceMsgPerSubjectLimit(fireCallback bool) {
 			// Grab the ss entry for this subject in case sparse.
 			mb.mu.Lock()
 			if mb.cacheNotLoaded() {
-				mb.loadMsgsWithLock()
+				err := mb.loadMsgsWithLock()
+				if err != nil {
+					log.Printf("OHDBG: error calling mb.loadMsgsWithLock() in enforceMsgPerSubjectLimit, err=[%s]", err)
+				}
 			}
-			mb.ensurePerSubjectInfoLoaded()
+			err := mb.ensurePerSubjectInfoLoaded()
+			if err != nil {
+				log.Printf("OHDBG: error calling mb.ensurePerSubjectInfoLoaded() in enforceMsgPerSubjectLimit, err=[%s]", err)
+			}
 			ss := mb.fss[subj]
 			if ss != nil && ss.firstNeedsUpdate {
 				mb.recalculateFirstForSubj(subj, ss.First, ss)
@@ -3345,7 +3586,10 @@ func (fs *fileStore) enforceMsgPerSubjectLimit(fireCallback bool) {
 				m, _, err := mb.firstMatching(subj, false, seq, &sm)
 				if err == nil {
 					seq = m.seq + 1
-					if removed, _ := fs.removeMsgViaLimits(m.seq); removed {
+					if removed, err := fs.removeMsgViaLimits(m.seq); removed {
+						if err != nil {
+							log.Printf("OHDBG: error calling fs.removeMsgViaLimits(m.seq) in enforceMsgPerSubjectLimit, err=[%s]", err)
+						}
 						total--
 						blks[mb] = struct{}{}
 					}
@@ -3541,7 +3785,10 @@ func (fs *fileStore) removeMsg(seq uint64, secure, viaLimits, needFSLock bool) (
 	fs.dirty++
 
 	// If we are tracking subjects here make sure we update that accounting.
-	mb.ensurePerSubjectInfoLoaded()
+	err = mb.ensurePerSubjectInfoLoaded()
+	if err != nil {
+		log.Printf("OHDBG: error calling mb.ensurePerSubjectInfoLoaded() in removeMsg, err=[%s]", err)
+	}
 
 	// If we are tracking multiple subjects here make sure we update that accounting.
 	mb.removeSeqPerSubject(sm.subj, seq)
@@ -3549,8 +3796,14 @@ func (fs *fileStore) removeMsg(seq uint64, secure, viaLimits, needFSLock bool) (
 
 	if secure {
 		// Grab record info.
-		ri, rl, _, _ := mb.slotInfo(int(seq - mb.cache.fseq))
-		mb.eraseMsg(seq, int(ri), int(rl))
+		ri, rl, _, err := mb.slotInfo(int(seq - mb.cache.fseq))
+		if err != nil {
+			log.Printf("OHDBG: error calling mb.slotInfo(int(seq - mb.cache.fseq)) in removeMsg, err=[%s]", err)
+		}
+		err = mb.eraseMsg(seq, int(ri), int(rl))
+		if err != nil {
+			log.Printf("OHDBG: error calling mb.eraseMsg(seq, int(ri), int(rl)) in removeMsg, err=[%s]", err)
+		}
 	}
 
 	fifo := seq == atomic.LoadUint64(&mb.first.seq)
@@ -3584,7 +3837,10 @@ func (fs *fileStore) removeMsg(seq uint64, secure, viaLimits, needFSLock bool) (
 	}
 
 	if secure {
-		if ld, _ := mb.flushPendingMsgsLocked(); ld != nil {
+		if ld, err := mb.flushPendingMsgsLocked(); ld != nil {
+			if err != nil {
+				log.Printf("OHDBG: error calling mb.flushPendingMsgsLocked() in removeMsg, err=[%s]", err)
+			}
 			// We have the mb lock here, this needs the mb locks so do in its own go routine.
 			go fs.rebuildState(ld)
 		}
@@ -3614,7 +3870,10 @@ func (fs *fileStore) removeMsg(seq uint64, secure, viaLimits, needFSLock bool) (
 	// If not via limits and not empty and last (empty writes tombstone above if last) write tombstone.
 	if !viaLimits && !(isEmpty && isLastBlock) {
 		if lmb := fs.lmb; sm != nil && lmb != nil {
-			lmb.writeTombstone(sm.seq, sm.ts)
+			err = lmb.writeTombstone(sm.seq, sm.ts)
+			if err != nil {
+				log.Printf("OHDBG: error calling lmb.writeTombstone(sm.seq, sm.ts) in removeMsg, err=[%s]", err)
+			}
 		}
 	}
 
@@ -3729,26 +3988,41 @@ func (mb *msgBlock) compact() {
 	}
 
 	// Close FDs first.
-	mb.closeFDsLocked()
+	err := mb.closeFDsLocked()
+	if err != nil {
+		log.Printf("OHDBG: error calling mb.closeFDsLocked() in compact, err=[%s]", err)
+	}
 
 	// We will write to a new file and mv/rename it in case of failure.
 	mfn := filepath.Join(mb.fs.fcfg.StoreDir, msgDir, fmt.Sprintf(newScan, mb.index))
 	if err := os.WriteFile(mfn, nbuf, defaultFilePerms); err != nil {
-		os.Remove(mfn)
+		err = os.Remove(mfn)
+		if err != nil {
+			log.Printf("OHDBG: error calling os.Remove(mfn) (first one) in compact, err=[%s]", err)
+		}
 		return
 	}
 	if err := os.Rename(mfn, mb.mfn); err != nil {
-		os.Remove(mfn)
+		err = os.Remove(mfn)
+		if err != nil {
+			log.Printf("OHDBG: error calling os.Remove(mfn) (second one) in compact, err=[%s]", err)
+		}
 		return
 	}
 
 	// Wipe dmap and rebuild here.
 	mb.dmap.Empty()
-	mb.rebuildStateLocked()
+	_, _, err = mb.rebuildStateLocked()
+	if err != nil {
+		log.Printf("OHDBG: error calling mb.rebuildStateLocked() in compact, err=[%s]", err)
+	}
 
 	// If we entered with the msgs loaded make sure to reload them.
 	if wasLoaded {
-		mb.loadMsgsWithLock()
+		err = mb.loadMsgsWithLock()
+		if err != nil {
+			log.Printf("OHDBG: error calling mb.loadMsgsWithLock() in compact, err=[%s]", err)
+		}
 	}
 }
 
@@ -3861,7 +4135,10 @@ func (mb *msgBlock) flushLoop(fch, qch chan struct{}) {
 					waiting = newWaiting
 					ts *= 2
 				}
-				mb.flushPendingMsgs()
+				err := mb.flushPendingMsgs()
+				if err != nil {
+					log.Printf("OHDBG: error calling mb.flushPendingMsgs() in flushLoop, err=[%s]", err)
+				}
 				// Check if we are no longer the last message block. If we are
 				// not we can close FDs and exit.
 				mb.fs.mu.RLock()
@@ -3891,7 +4168,10 @@ func (mb *msgBlock) eraseMsg(seq uint64, ri, rl int) error {
 
 	// Randomize record
 	data := make([]byte, rl-emptyRecordLen)
-	rand.Read(data)
+	_, err := rand.Read(data)
+	if err != nil {
+		log.Printf("OHDBG: error calling rand.Read(data) in eraseMsg, err=[%s]", err)
+	}
 
 	// Now write to underlying buffer.
 	var b bytes.Buffer
@@ -3922,9 +4202,17 @@ func (mb *msgBlock) eraseMsg(seq uint64, ri, rl int) error {
 		if err != nil {
 			return err
 		}
-		defer mfd.Close()
+		defer func() {
+			err = mfd.Close()
+			if err != nil {
+				log.Printf("OHDBG: error calling mfd.Close() in eraseMsg, err=[%s]", err)
+			}
+		}()
 		if _, err = mfd.WriteAt(nbytes, int64(ri)); err == nil {
-			mfd.Sync()
+			err = mfd.Sync()
+			if err != nil {
+				log.Printf("OHDBG: error calling mfd.Sync() in eraseMsg, err=[%s]", err)
+			}
 		}
 		if err != nil {
 			return err
@@ -4027,14 +4315,29 @@ func (mb *msgBlock) truncate(sm *StoreMsg) (nmsgs, nbytes uint64, err error) {
 		if n != len(buf) {
 			return 0, 0, fmt.Errorf("short write (%d != %d)", n, len(buf))
 		}
-		mb.mfd.Truncate(int64(len(buf)))
-		mb.mfd.Sync()
+		err = mb.mfd.Truncate(int64(len(buf)))
+		if err != nil {
+			log.Printf("OHDBG: error calling mb.mfd.Truncate(int64(len(buf))) in truncate, err=[%s]", err)
+		}
+		err = mb.mfd.Sync()
+		if err != nil {
+			log.Printf("OHDBG: error calling mb.mfd.Sync() (first one) in truncate, err=[%s]", err)
+		}
 	} else if mb.mfd != nil {
-		mb.mfd.Truncate(eof)
-		mb.mfd.Sync()
+		err = mb.mfd.Truncate(eof)
+		if err != nil {
+			log.Printf("OHDBG: error calling mb.mfd.Truncate(eof) in truncate, err=[%s]", err)
+		}
+		err = mb.mfd.Sync()
+		if err != nil {
+			log.Printf("OHDBG: error calling mb.mfd.Sync() in truncate, err=[%s]", err)
+		}
 		// Update our checksum.
 		var lchk [8]byte
-		mb.mfd.ReadAt(lchk[:], eof-8)
+		_, err = mb.mfd.ReadAt(lchk[:], eof-8)
+		if err != nil {
+			log.Printf("OHDBG: error calling mb.mfd.ReadAt(lchk[:], eof-8) in truncate, err=[%s]", err)
+		}
 		copy(mb.lchk[0:], lchk[:])
 	} else {
 		mb.mu.Unlock()
@@ -4049,12 +4352,18 @@ func (mb *msgBlock) truncate(sm *StoreMsg) (nmsgs, nbytes uint64, err error) {
 	mb.clearCacheAndOffset()
 
 	// Redo per subject info for this block.
-	mb.resetPerSubjectInfo()
+	err = mb.resetPerSubjectInfo()
+	if err != nil {
+		log.Printf("OHDBG: error calling mb.resetPerSubjectInfo() in truncate, err=[%s]", err)
+	}
 
 	mb.mu.Unlock()
 
 	// Load msgs again.
-	mb.loadMsgs()
+	err = mb.loadMsgs()
+	if err != nil {
+		log.Printf("OHDBG: error calling mb.loadMsgs() in truncate, err=[%s]", err)
+	}
 
 	return purged, bytes, nil
 }
@@ -4088,11 +4397,17 @@ func (mb *msgBlock) selectNextFirst() {
 	// Need to get the timestamp.
 	// We will try the cache direct and fallback if needed.
 	var smv StoreMsg
-	sm, _ := mb.cacheLookup(seq, &smv)
+	sm, err := mb.cacheLookup(seq, &smv)
+	if err != nil {
+		log.Printf("OHDBG: error calling mb.cacheLookup(seq, &smv) in selectNextFirst, err=[%s]", err)
+	}
 	if sm == nil {
 		// Slow path, need to unlock.
 		mb.mu.Unlock()
-		sm, _, _ = mb.fetchMsg(seq, &smv)
+		sm, _, err = mb.fetchMsg(seq, &smv)
+		if err != nil {
+			log.Printf("OHDBG: error calling mb.fetchMsg(seq, &smv) in selectNextFirst, err=[%s]", err)
+		}
 		mb.mu.Lock()
 	}
 	if sm != nil {
@@ -4304,9 +4619,20 @@ func (fs *fileStore) expireMsgs() {
 	minAge := time.Now().UnixNano() - maxAge
 	fs.mu.RUnlock()
 
-	for sm, _ = fs.msgForSeq(0, &smv); sm != nil && sm.ts <= minAge; sm, _ = fs.msgForSeq(0, &smv) {
+	var errorOne error
+	var errorTwo error
+	for sm, errorOne = fs.msgForSeq(0, &smv); sm != nil && sm.ts <= minAge; sm, errorTwo = fs.msgForSeq(0, &smv) {
+		if errorOne != nil {
+			log.Printf("OHDBG: error calling fs.msgForSeq(0, &smv) in expireMsgs, err=[%s]", errorOne)
+		}
+		if errorTwo != nil {
+			log.Printf("OHDBG: error calling fs.msgForSeq(0, &smv) in expireMsgs, err=[%s]", errorTwo)
+		}
 		fs.mu.Lock()
-		fs.removeMsgViaLimits(sm.seq)
+		_, err := fs.removeMsgViaLimits(sm.seq)
+		if err != nil {
+			log.Printf("OHDBG: error calling removeMsgViaLimits(sm.seq) in expireMsgs, err=[%s]", err)
+		}
 		fs.mu.Unlock()
 		// Recalculate in case we are expiring a bunch.
 		minAge = time.Now().UnixNano() - maxAge
@@ -4333,7 +4659,10 @@ func (fs *fileStore) checkAndFlushAllBlocks() {
 		if mb.pendingWriteSize() > 0 {
 			// Since fs lock is held need to pull this apart in case we need to rebuild state.
 			mb.mu.Lock()
-			ld, _ := mb.flushPendingMsgsLocked()
+			ld, err := mb.flushPendingMsgsLocked()
+			if err != nil {
+				log.Printf("OHDBG: error calling mb.flushPendingMsgsLocked() in checkAndFlushAllBlocks, err=[%s]", err)
+			}
 			mb.mu.Unlock()
 			if ld != nil {
 				fs.rebuildStateLocked(ld)
@@ -4354,9 +4683,15 @@ func (fs *fileStore) checkMsgs() *LostStreamData {
 
 	for _, mb := range fs.blks {
 		// Make sure encryption loaded if needed for the block.
-		fs.loadEncryptionForMsgBlock(mb)
+		err := fs.loadEncryptionForMsgBlock(mb)
+		if err != nil {
+			log.Printf("OHDBG: error calling fs.loadEncryptionForMsgBlock(mb) in checkMsgs, err=[%s]", err)
+		}
 		// FIXME(dlc) - check tombstones here too?
 		if ld, _, err := mb.rebuildState(); err != nil && ld != nil {
+			if err != nil {
+				log.Printf("OHDBG: error calling mb.rebuildState() in checkMsgs, err=[%s]", err)
+			}
 			// Rebuild fs state too.
 			fs.rebuildStateLocked(ld)
 		}
@@ -4546,7 +4881,10 @@ func (mb *msgBlock) closeFDs() error {
 }
 
 func (mb *msgBlock) closeFDsLocked() error {
-	if buf, _ := mb.bytesPending(); len(buf) > 0 {
+	if buf, err := mb.bytesPending(); len(buf) > 0 {
+		if err != nil {
+			log.Printf("OHDBG: error calling mb.bytesPending() in closeFDsLocked, err=[%s]", err)
+		}
 		return errPendingData
 	}
 	mb.closeFDsLockedNoCheck()
@@ -4555,7 +4893,10 @@ func (mb *msgBlock) closeFDsLocked() error {
 
 func (mb *msgBlock) closeFDsLockedNoCheck() {
 	if mb.mfd != nil {
-		mb.mfd.Close()
+		err := mb.mfd.Close()
+		if err != nil {
+			log.Printf("OHDBG: error calling mb.mfd.Close() in closeFDsLockedNoCheck, err=[%s]", err)
+		}
 		mb.mfd = nil
 	}
 }
@@ -4746,8 +5087,14 @@ func (mb *msgBlock) recompressOnDiskIfNeeded() error {
 	// Write the new block data (which might be compressed or encrypted) to the
 	// temporary file.
 	errorCleanup := func(err error) error {
-		tmpFD.Close()
-		os.Remove(tmpFN)
+		myErr := tmpFD.Close()
+		if myErr != nil {
+			log.Printf("OHDBG: error calling tmpFD.Close() in closeFDsLockedNoCheck, err=[%s]", myErr)
+		}
+		myErr = os.Remove(tmpFN)
+		if myErr != nil {
+			log.Printf("OHDBG: error calling os.Remove(tmpFN) in closeFDsLockedNoCheck, err=[%s]", myErr)
+		}
 		return err
 	}
 	if n, err := tmpFD.Write(cmpBuf); err != nil {
@@ -4803,7 +5150,12 @@ func (mb *msgBlock) ensureRawBytesLoaded() error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() {
+		err := f.Close()
+		if err != nil {
+			log.Printf("OHDBG: error calling f.Close() in ensureRawBytesLoaded, err=[%s]", err)
+		}
+	}()
 	if fi, err := f.Stat(); fi != nil && err == nil {
 		mb.rbytes = uint64(fi.Size())
 	} else {
@@ -4847,7 +5199,10 @@ func (fs *fileStore) syncBlocks() {
 		needSync, fn := mb.needSync, mb.mfn
 		if needSync {
 			// Flush anything that may be pending.
-			mb.flushPendingMsgsLocked()
+			_, err := mb.flushPendingMsgsLocked()
+			if err != nil {
+				log.Printf("OHDBG: error calling mb.flushPendingMsgsLocked() in syncBlocks, err=[%s]", err)
+			}
 		}
 		mb.mu.Unlock()
 
@@ -4864,9 +5219,15 @@ func (fs *fileStore) syncBlocks() {
 		// Check if we need to sync.
 		// This is done not holding any locks.
 		if needSync {
-			if fd, _ := os.OpenFile(fn, os.O_RDWR, defaultFilePerms); fd != nil {
+			if fd, err := os.OpenFile(fn, os.O_RDWR, defaultFilePerms); fd != nil {
+				if err != nil {
+					log.Printf("OHDBG: error calling os.OpenFile(fn, os.O_RDWR, defaultFilePerms) in syncBlocks, err=[%s]", err)
+				}
 				canClear := fd.Sync() == nil
-				fd.Close()
+				err = fd.Close()
+				if err != nil {
+					log.Printf("OHDBG: error calling fd.Close() in syncBlocks, err=[%s]", err)
+				}
 				// Only clear sync flag on success.
 				if canClear {
 					mb.mu.Lock()
@@ -4892,9 +5253,18 @@ func (fs *fileStore) syncBlocks() {
 
 	// Sync state file if we are not running with sync always.
 	if !syncAlways {
-		if fd, _ := os.OpenFile(fn, os.O_RDWR, defaultFilePerms); fd != nil {
-			fd.Sync()
-			fd.Close()
+		if fd, err := os.OpenFile(fn, os.O_RDWR, defaultFilePerms); fd != nil {
+			if err != nil {
+				log.Printf("OHDBG: error calling os.OpenFile(fn, os.O_RDWR, defaultFilePerms) in syncBlocks, err=[%s]", err)
+			}
+			err = fd.Sync()
+			if err != nil {
+				log.Printf("OHDBG: error calling fd.Sync() in syncBlocks, err=[%s]", err)
+			}
+			err = fd.Close()
+			if err != nil {
+				log.Printf("OHDBG: error calling fd.Close() in syncBlocks, err=[%s]", err)
+			}
 		}
 	}
 }
@@ -5148,7 +5518,10 @@ func (mb *msgBlock) flushPendingMsgsLocked() (*LostStreamData, error) {
 		n, err := mb.writeAt(buf, woff)
 		if err != nil {
 			mb.dirtyCloseWithRemove(false)
-			ld, _, _ := mb.rebuildStateLocked()
+			ld, _, err := mb.rebuildStateLocked()
+			if err != nil {
+				log.Printf("OHDBG: error calling mb.rebuildStateLocked() in flushPendingMsgsLocked, err=[%s]", err)
+			}
 			mb.werr = err
 			return ld, err
 		}
@@ -5173,7 +5546,10 @@ func (mb *msgBlock) flushPendingMsgsLocked() (*LostStreamData, error) {
 
 	// Check if we are in sync always mode.
 	if mb.syncAlways {
-		mb.mfd.Sync()
+		err = mb.mfd.Sync()
+		if err != nil {
+			log.Printf("OHDBG: error calling mb.mfd.Sync() in flushPendingMsgsLocked, err=[%s]", err)
+		}
 	} else {
 		mb.needSync = true
 	}
@@ -5250,7 +5626,12 @@ func (mb *msgBlock) loadBlock(buf []byte) ([]byte, error) {
 		}
 		return nil, err
 	}
-	defer f.Close()
+	defer func() {
+		err = f.Close()
+		if err != nil {
+			log.Printf("OHDBG: error calling f.Close() in loadBlock, err=[%s]", err)
+		}
+	}()
 
 	var sz int
 	if info, err := f.Stat(); err == nil {
@@ -5319,7 +5700,10 @@ checkCache:
 	mb.llts = time.Now().UnixNano()
 
 	// FIXME(dlc) - We could be smarter here.
-	if buf, _ := mb.bytesPending(); len(buf) > 0 {
+	if buf, err := mb.bytesPending(); len(buf) > 0 {
+		if err != nil {
+			log.Printf("OHDBG: error calling mb.bytesPending() in loadMsgsWithLock, err=[%s]", err)
+		}
 		ld, err := mb.flushPendingMsgsLocked()
 		if ld != nil && mb.fs != nil {
 			// We do not know if fs is locked or not at this point.
@@ -5518,7 +5902,10 @@ func (fs *fileStore) sizeForSeq(seq uint64) int {
 	}
 	var smv StoreMsg
 	if mb := fs.selectMsgBlock(seq); mb != nil {
-		if sm, _, _ := mb.fetchMsg(seq, &smv); sm != nil {
+		if sm, _, err := mb.fetchMsg(seq, &smv); sm != nil {
+			if err != nil {
+				log.Printf("OHDBG: error calling mb.fetchMsg(seq, &smv) in sizeForSeq, err=[%s]", err)
+			}
 			return int(fileStoreMsgSize(sm.subj, sm.hdr, sm.msg))
 		}
 	}
@@ -5916,7 +6303,12 @@ func (mb *msgBlock) readIndexInfo() error {
 	}
 
 	if err := checkNewHeader(buf); err != nil {
-		defer os.Remove(ifn)
+		defer func() {
+			err = os.Remove(ifn)
+			if err != nil {
+				log.Printf("OHDBG: error calling os.Remove(ifn) (first one) in readIndexInfo, err=[%s]", err)
+			}
+		}()
 		return fmt.Errorf("bad index file")
 	}
 
@@ -5958,13 +6350,19 @@ func (mb *msgBlock) readIndexInfo() error {
 
 	// Check if this is a short write index file.
 	if bi < 0 || bi+checksumSize > len(buf) {
-		os.Remove(ifn)
+		err = os.Remove(ifn)
+		if err != nil {
+			log.Printf("OHDBG: error calling os.Remove(ifn) (second one) in readIndexInfo, err=[%s]", err)
+		}
 		return fmt.Errorf("short index file")
 	}
 
 	// Check for consistency if accounting. If something is off bail and we will rebuild.
 	if mb.msgs != (atomic.LoadUint64(&mb.last.seq)-atomic.LoadUint64(&mb.first.seq)+1)-dmapLen {
-		os.Remove(ifn)
+		err = os.Remove(ifn)
+		if err != nil {
+			log.Printf("OHDBG: error calling os.Remove(ifn) (third one) in readIndexInfo, err=[%s]", err)
+		}
 		return fmt.Errorf("accounting inconsistent")
 	}
 
@@ -6098,7 +6496,10 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64) (purged uint
 
 		var shouldExpire bool
 		if mb.cacheNotLoaded() {
-			mb.loadMsgsWithLock()
+			err = mb.loadMsgsWithLock()
+			if err != nil {
+				log.Printf("OHDBG: error calling mb.loadMsgsWithLock() in PurgeEx, err=[%s]", err)
+			}
 			shouldExpire = true
 		}
 		if sequence > 1 && sequence <= l {
@@ -6106,7 +6507,10 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64) (purged uint
 		}
 
 		for seq := f; seq <= l; seq++ {
-			if sm, _ := mb.cacheLookup(seq, &smv); sm != nil && eq(sm.subj, subject) {
+			if sm, err := mb.cacheLookup(seq, &smv); sm != nil && eq(sm.subj, subject) {
+				if err != nil {
+					log.Printf("OHDBG: error calling mb.cacheLookup(seq, &smv) in PurgeEx, err=[%s]", err)
+				}
 				rl := fileStoreMsgSize(sm.subj, sm.hdr, sm.msg)
 				// Do fast in place remove.
 				// Stats
@@ -6223,14 +6627,23 @@ func (fs *fileStore) purge(fseq uint64) (uint64, error) {
 	// If purge directory still exists then we need to wait
 	// in place and remove since rename would fail.
 	if _, err := os.Stat(pdir); err == nil {
-		os.RemoveAll(pdir)
+		err = os.RemoveAll(pdir)
+		if err != nil {
+			log.Printf("OHDBG: error calling os.RemoveAll(pdir) in purge, err=[%s]", err)
+		}
 	}
-	os.Rename(mdir, pdir)
+	err := os.Rename(mdir, pdir)
+	if err != nil {
+		log.Printf("OHDBG: error calling os.Rename(mdir, pdir) in purge, err=[%s]", err)
+	}
 
 	go os.RemoveAll(pdir)
 
 	// Create new one.
-	os.MkdirAll(mdir, defaultDirPerms)
+	err = os.MkdirAll(mdir, defaultDirPerms)
+	if err != nil {
+		log.Printf("OHDBG: error calling os.MkdirAll(mdir, defaultDirPerms) in purge, err=[%s]", err)
+	}
 
 	// Make sure we have a lmb to write to.
 	if _, err := fs.newMsgBlockForWrite(); err != nil {
@@ -6252,7 +6665,10 @@ func (fs *fileStore) purge(fseq uint64) (uint64, error) {
 	if lseq := atomic.LoadUint64(&lmb.last.seq); lseq > 1 {
 		// Leave a tombstone so we can remember our starting sequence in case
 		// full state becomes corrupted.
-		lmb.writeTombstone(lseq, lmb.last.ts)
+		err = lmb.writeTombstone(lseq, lmb.last.ts)
+		if err != nil {
+			log.Printf("OHDBG: error calling lmb.writeTombstone(lseq, lmb.last.ts) in purge, err=[%s]", err)
+		}
 	}
 
 	cb := fs.scb
@@ -6298,7 +6714,10 @@ func (fs *fileStore) Compact(seq uint64) (uint64, error) {
 		purged += mb.msgs
 		bytes += mb.bytes
 		// Make sure we do subject cleanup as well.
-		mb.ensurePerSubjectInfoLoaded()
+		err := mb.ensurePerSubjectInfoLoaded()
+		if err != nil {
+			log.Printf("OHDBG: error calling mb.ensurePerSubjectInfoLoaded() in Compact, err=[%s]", err)
+		}
 		for subj, ss := range mb.fss {
 			for i := uint64(0); i < ss.Msgs; i++ {
 				fs.removePerSubject(subj)
@@ -6526,7 +6945,10 @@ func (fs *fileStore) Truncate(seq uint64) error {
 		fs.mu.Unlock()
 		return ErrInvalidSequence
 	}
-	lsm, _, _ := nlmb.fetchMsg(seq, nil)
+	lsm, _, err := nlmb.fetchMsg(seq, nil)
+	if err != nil {
+		log.Printf("OHDBG: error calling nlmb.fetchMsg(seq, nil) in Truncate, err=[%s]", err)
+	}
 	if lsm == nil {
 		fs.mu.Unlock()
 		return ErrInvalidSequence
@@ -6639,8 +7061,14 @@ func (fs *fileStore) removeMsgBlock(mb *msgBlock) {
 		// Creating a new message write block requires that the lmb lock is not held.
 		mb.mu.Unlock()
 		// Write the tombstone to remember since this was last block.
-		if lmb, _ := fs.newMsgBlockForWrite(); lmb != nil {
-			lmb.writeTombstone(lseq, lts)
+		if lmb, err := fs.newMsgBlockForWrite(); lmb != nil {
+			if err != nil {
+				log.Printf("OHDBG: error calling fs.newMsgBlockForWrite() in removeMsgBlock, err=[%s]", err)
+			}
+			err = lmb.writeTombstone(lseq, lts)
+			if err != nil {
+				log.Printf("OHDBG: error calling lmb.writeTombstone(lseq, lts) in removeMsgBlock, err=[%s]", err)
+			}
 		}
 		mb.mu.Lock()
 	}
@@ -6674,16 +7102,25 @@ func (mb *msgBlock) dirtyCloseWithRemove(remove bool) {
 		mb.qch = nil
 	}
 	if mb.mfd != nil {
-		mb.mfd.Close()
+		err := mb.mfd.Close()
+		if err != nil {
+			log.Printf("OHDBG: error calling mb.mfd.Close() in dirtyCloseWithRemove, err=[%s]", err)
+		}
 		mb.mfd = nil
 	}
 	if remove {
 		if mb.mfn != _EMPTY_ {
-			os.Remove(mb.mfn)
+			err := os.Remove(mb.mfn)
+			if err != nil {
+				log.Printf("OHDBG: error calling os.Remove(mb.mfn) in dirtyCloseWithRemove, err=[%s]", err)
+			}
 			mb.mfn = _EMPTY_
 		}
 		if mb.kfn != _EMPTY_ {
-			os.Remove(mb.kfn)
+			err := os.Remove(mb.kfn)
+			if err != nil {
+				log.Printf("OHDBG: error calling os.Remove(mb.kfn) in dirtyCloseWithRemove, err=[%s]", err)
+			}
 		}
 		// Since we are removing a block kick the state flusher.
 		mb.fs.kickFlushStateLoop()
@@ -6693,7 +7130,10 @@ func (mb *msgBlock) dirtyCloseWithRemove(remove bool) {
 // Remove a seq from the fss and select new first.
 // Lock should be held.
 func (mb *msgBlock) removeSeqPerSubject(subj string, seq uint64) {
-	mb.ensurePerSubjectInfoLoaded()
+	err := mb.ensurePerSubjectInfoLoaded()
+	if err != nil {
+		log.Printf("OHDBG: error calling mb.ensurePerSubjectInfoLoaded() in removeSeqPerSubject, err=[%s]", err)
+	}
 	ss := mb.fss[subj]
 	if ss == nil {
 		return
@@ -6905,9 +7345,15 @@ func (mb *msgBlock) close(sync bool) {
 	}
 	if mb.mfd != nil {
 		if sync {
-			mb.mfd.Sync()
+			err := mb.mfd.Sync()
+			if err != nil {
+				log.Printf("OHDBG: error calling mb.mfd.Sync() in close, err=[%s]", err)
+			}
 		}
-		mb.mfd.Close()
+		err := mb.mfd.Close()
+		if err != nil {
+			log.Printf("OHDBG: error calling mb.mfd.Close() in close, err=[%s]", err)
+		}
 	}
 	mb.mfd = nil
 	// Mark as closed.
@@ -6923,7 +7369,10 @@ func (fs *fileStore) closeAllMsgBlocks(sync bool) {
 func (fs *fileStore) Delete() error {
 	if fs.isClosed() {
 		// Always attempt to remove since we could have been closed beforehand.
-		os.RemoveAll(fs.fcfg.StoreDir)
+		err := os.RemoveAll(fs.fcfg.StoreDir)
+		if err != nil {
+			log.Printf("OHDBG: error calling os.RemoveAll(fs.fcfg.StoreDir) in Delete, err=[%s]", err)
+		}
 		// Since we did remove, if we did have anything remaining make sure to
 		// call into any storage updates that had been registered.
 		fs.mu.Lock()
@@ -6941,11 +7390,17 @@ func (fs *fileStore) Delete() error {
 	// If purge directory still exists then we need to wait
 	// in place and remove since rename would fail.
 	if _, err := os.Stat(pdir); err == nil {
-		os.RemoveAll(pdir)
+		err = os.RemoveAll(pdir)
+		if err != nil {
+			log.Printf("OHDBG: error calling os.RemoveAll(pdir) in Delete, err=[%s]", err)
+		}
 	}
 
 	// Do Purge() since if we have lots of blocks uses a mv/rename.
-	fs.Purge()
+	_, err := fs.Purge()
+	if err != nil {
+		log.Printf("OHDBG: error calling fs.Purge() in Delete, err=[%s]", err)
+	}
 
 	if err := fs.Stop(); err != nil {
 		return err
@@ -7019,7 +7474,10 @@ func (fs *fileStore) flushStreamStateLoop(fch, qch, done chan struct{}) {
 		select {
 		case <-fch:
 			if elapsed := time.Since(lastWrite); elapsed > writeThreshold {
-				fs.writeFullState()
+				err := fs.writeFullState()
+				if err != nil {
+					log.Printf("OHDBG: error calling fs.writeFullState() (first one) in flushStreamStateLoop, err=[%s]", err)
+				}
 				lastWrite = time.Now()
 				if dt != nil {
 					dt.Stop()
@@ -7034,7 +7492,10 @@ func (fs *fileStore) flushStreamStateLoop(fch, qch, done chan struct{}) {
 				dtc = dt.C
 			}
 		case <-dtc:
-			fs.writeFullState()
+			err := fs.writeFullState()
+			if err != nil {
+				log.Printf("OHDBG: error calling fs.writeFullState() (second one) in flushStreamStateLoop, err=[%s]", err)
+			}
 			lastWrite = time.Now()
 			dt, dtc = nil, nil
 		case <-qch:
@@ -7146,7 +7607,10 @@ func (fs *fileStore) writeFullState() error {
 		numDeleted := mb.dmap.Size()
 		buf = binary.AppendUvarint(buf, uint64(numDeleted))
 		if numDeleted > 0 {
-			dmap, _ := mb.dmap.Encode(scratch[:0])
+			dmap, err := mb.dmap.Encode(scratch[:0])
+			if err != nil {
+				log.Printf("OHDBG: error calling mb.dmap.Encode(scratch[:0]) in writeFullState, err=[%s]", err)
+			}
 			dmapTotalLen += len(dmap)
 			buf = append(buf, dmap...)
 		}
@@ -7174,7 +7638,10 @@ func (fs *fileStore) writeFullState() error {
 			return err
 		}
 		nonce := make([]byte, fs.aek.NonceSize(), fs.aek.NonceSize()+len(buf)+fs.aek.Overhead())
-		rand.Read(nonce)
+		_, err := rand.Read(nonce)
+		if err != nil {
+			log.Printf("OHDBG: error calling rand.Read(nonce) in writeFullState, err=[%s]", err)
+		}
 		buf = fs.aek.Seal(nonce, nonce, buf, nil)
 	}
 
@@ -7200,11 +7667,22 @@ func (fs *fileStore) writeFullState() error {
 		return err
 	}
 	tmpName := f.Name()
-	defer os.Remove(tmpName)
+	defer func() {
+		err = os.Remove(tmpName)
+		if err != nil {
+			log.Printf("OHDBG: error calling os.Remove(tmpName) in writeFullState, err=[%s]", err)
+		}
+	}()
 	if _, err = f.Write(buf); err == nil && fs.fcfg.SyncAlways {
-		f.Sync()
+		err = f.Sync()
+		if err != nil {
+			log.Printf("OHDBG: error calling f.Sync() in writeFullState, err=[%s]", err)
+		}
 	}
-	f.Close()
+	otherErr := f.Close()
+	if otherErr != nil {
+		log.Printf("OHDBG: error calling f.Close() in writeFullState, err=[%s]", otherErr)
+	}
 	if err != nil {
 		return err
 	}
@@ -7252,7 +7730,10 @@ func (fs *fileStore) Stop() error {
 	fs.mu.Unlock()
 	<-fsld
 	// Write full state if needed. If not dirty this is a no-op.
-	fs.writeFullState()
+	err := fs.writeFullState()
+	if err != nil {
+		log.Printf("OHDBG: error calling fs.writeFullState() in Stop, err=[%s]", err)
+	}
 	fs.mu.Lock()
 
 	// Mark as closed. Last message block needs to be cleared after
@@ -7269,7 +7750,10 @@ func (fs *fileStore) Stop() error {
 	fs.mu.Unlock()
 
 	for _, o := range cfs {
-		o.Stop()
+		err = o.Stop()
+		if err != nil {
+			log.Printf("OHDBG: error calling o.Stop() in Stop, err=[%s]", err)
+		}
 	}
 
 	if bytes > 0 && cb != nil {
@@ -7283,13 +7767,28 @@ const errFile = "errors.txt"
 
 // Stream our snapshot through S2 compression and tar.
 func (fs *fileStore) streamSnapshot(w io.WriteCloser, state *StreamState, includeConsumers bool) {
-	defer w.Close()
+	defer func() {
+		err := w.Close()
+		if err != nil {
+			log.Printf("OHDBG: error calling w.Close() in streamSnapshot, err=[%s]", err)
+		}
+	}()
 
 	enc := s2.NewWriter(w)
-	defer enc.Close()
+	defer func() {
+		err := enc.Close()
+		if err != nil {
+			log.Printf("OHDBG: error calling enc.Close() in streamSnapshot, err=[%s]", err)
+		}
+	}()
 
 	tw := tar.NewWriter(enc)
-	defer tw.Close()
+	defer func() {
+		err := tw.Close()
+		if err != nil {
+			log.Printf("OHDBG: error calling tw.Close() in streamSnapshot, err=[%s]", err)
+		}
+	}()
 
 	defer func() {
 		fs.mu.Lock()
@@ -7319,7 +7818,11 @@ func (fs *fileStore) streamSnapshot(w io.WriteCloser, state *StreamState, includ
 	}
 
 	writeErr := func(err string) {
-		writeFile(errFile, []byte(err))
+		// because obviously err is a string
+		actualErr := writeFile(errFile, []byte(err))
+		if actualErr != nil {
+			log.Printf("OHDBG: error calling tw.Close() in streamSnapshot, err=[%s]", actualErr)
+		}
 	}
 
 	fs.mu.Lock()
@@ -7373,7 +7876,10 @@ func (fs *fileStore) streamSnapshot(w io.WriteCloser, state *StreamState, includ
 	// Now do messages themselves.
 	for _, mb := range blks {
 		if mb.pendingWriteSize() > 0 {
-			mb.flushPendingMsgs()
+			err = mb.flushPendingMsgs()
+			if err != nil {
+				log.Printf("OHDBG: error calling mb.flushPendingMsgs() in streamSnapshot, err=[%s]", err)
+			}
 		}
 		mb.mu.Lock()
 		// We could stream but don't want to hold the lock and prevent changes, so just read in and
@@ -7453,7 +7959,10 @@ func (fs *fileStore) streamSnapshot(w io.WriteCloser, state *StreamState, includ
 		if writeFile(filepath.Join(odirPre, JetStreamMetaFileSum), sum) != nil {
 			return
 		}
-		writeFile(filepath.Join(odirPre, consumerState), state)
+		err = writeFile(filepath.Join(odirPre, consumerState), state)
+		if err != nil {
+			log.Printf("OHDBG: error calling writeFile(filepath.Join(odirPre, consumerState), state) in streamSnapshot, err=[%s]", err)
+		}
 	}
 }
 
@@ -7481,13 +7990,19 @@ func (fs *fileStore) Snapshot(deadline time.Duration, checkMsgs, includeConsumer
 	}
 
 	// Write out full state as well before proceeding.
-	fs.writeFullState()
+	err := fs.writeFullState()
+	if err != nil {
+		log.Printf("OHDBG: error calling fs.writeFullState() in Snapshot, err=[%s]", err)
+	}
 
 	pr, pw := net.Pipe()
 
 	// Set a write deadline here to protect ourselves.
 	if deadline > 0 {
-		pw.SetWriteDeadline(time.Now().Add(deadline))
+		err := pw.SetWriteDeadline(time.Now().Add(deadline))
+		if err != nil {
+			log.Printf("OHDBG: error calling pw.SetWriteDeadline(time.Now().Add(deadline)) in Snapshot, err=[%s]", err)
+		}
 	}
 
 	// We can add to our stream while snapshotting but not "user" delete anything.
@@ -7629,7 +8144,10 @@ func (fs *fileStore) SyncDeleted(dbs DeleteBlocks) {
 
 	for _, db := range needsCheck {
 		db.Range(func(dseq uint64) bool {
-			fs.removeMsg(dseq, false, true, false)
+			_, err := fs.removeMsg(dseq, false, true, false)
+			if err != nil {
+				log.Printf("OHDBG: error calling fs.removeMsg(dseq, false, true, false) in SyncDeleted, err=[%s]", err)
+			}
 			return true
 		})
 	}
@@ -7673,7 +8191,10 @@ func (fs *fileStore) ConsumerStore(name string, cfg *ConsumerConfig) (ConsumerSt
 	if cfg.MemoryStorage {
 		// Create directly here.
 		o := &consumerMemStore{ms: fs, cfg: *cfg}
-		fs.AddConsumer(o)
+		err := fs.AddConsumer(o)
+		if err != nil {
+			log.Printf("OHDBG: error calling fs.AddConsumer(o) in ConsumerStore, err=[%s]", err)
+		}
 		return o, nil
 	}
 
@@ -7740,7 +8261,10 @@ func (fs *fileStore) ConsumerStore(name string, cfg *ConsumerConfig) (ConsumerSt
 		didCreate = true
 		csi.Created = time.Now().UTC()
 		if err := o.writeConsumerMeta(); err != nil {
-			os.RemoveAll(odir)
+			err := os.RemoveAll(odir)
+			if err != nil {
+				log.Printf("OHDBG: error calling os.RemoveAll(odir) (first one) in ConsumerStore, err=[%s]", err)
+			}
 			return nil, err
 		}
 	}
@@ -7752,7 +8276,10 @@ func (fs *fileStore) ConsumerStore(name string, cfg *ConsumerConfig) (ConsumerSt
 		if _, err := os.Stat(keyFile); err != nil && os.IsNotExist(err) {
 			if err := o.writeConsumerMeta(); err != nil {
 				if didCreate {
-					os.RemoveAll(odir)
+					err = os.RemoveAll(odir)
+					if err != nil {
+						log.Printf("OHDBG: error calling os.RemoveAll(odir) (second one) in ConsumerStore, err=[%s]", err)
+					}
 				}
 				return nil, err
 			}
@@ -7761,7 +8288,10 @@ func (fs *fileStore) ConsumerStore(name string, cfg *ConsumerConfig) (ConsumerSt
 				if _, err := decodeConsumerState(buf); err == nil {
 					if err := os.WriteFile(o.ifn, o.encryptState(buf), defaultFilePerms); err != nil {
 						if didCreate {
-							os.RemoveAll(odir)
+							err = os.RemoveAll(odir)
+							if err != nil {
+								log.Printf("OHDBG: error calling os.RemoveAll(odir) in ConsumerStore, err=[%s]", err)
+							}
 						}
 						return nil, err
 					}
@@ -7779,7 +8309,10 @@ func (fs *fileStore) ConsumerStore(name string, cfg *ConsumerConfig) (ConsumerSt
 	o.loadState()
 
 	// Assign to filestore.
-	fs.AddConsumer(o)
+	err = fs.AddConsumer(o)
+	if err != nil {
+		log.Printf("OHDBG: error calling fs.AddConsumer(o) in ConsumerStore, err=[%s]", err)
+	}
 
 	return o, nil
 }
@@ -8169,7 +8702,10 @@ func (o *consumerFileStore) encryptState(buf []byte) []byte {
 	}
 	// TODO(dlc) - Optimize on space usage a bit?
 	nonce := make([]byte, o.aek.NonceSize(), o.aek.NonceSize()+len(buf)+o.aek.Overhead())
-	rand.Read(nonce)
+	_, err := rand.Read(nonce)
+	if err != nil {
+		log.Printf("OHDBG: error rand.Read(nonce) in encryptState, err=[%s]", err)
+	}
 	return o.aek.Seal(nonce, nonce, buf, nil)
 }
 
@@ -8261,7 +8797,10 @@ func (cfs *consumerFileStore) writeConsumerMeta() error {
 	// Encrypt if needed.
 	if cfs.aek != nil {
 		nonce := make([]byte, cfs.aek.NonceSize(), cfs.aek.NonceSize()+len(b)+cfs.aek.Overhead())
-		rand.Read(nonce)
+		_, err = rand.Read(nonce)
+		if err != nil {
+			log.Printf("OHDBG: error rand.Read(nonce) in writeConsumerMeta, err=[%s]", err)
+		}
 		b = cfs.aek.Seal(nonce, nonce, b, nil)
 	}
 
@@ -8412,7 +8951,10 @@ func (o *consumerFileStore) stateWithCopyLocked(doCopy bool) (*ConsumerState, er
 func (o *consumerFileStore) loadState() {
 	if _, err := os.Stat(o.ifn); err == nil {
 		// This will load our state in from disk.
-		o.stateWithCopyLocked(false)
+		_, err := o.stateWithCopyLocked(false)
+		if err != nil {
+			log.Printf("OHDBG: error o.stateWithCopyLocked(false) in loadState, err=[%s]", err)
+		}
 	}
 }
 
@@ -8551,7 +9093,10 @@ func (o *consumerFileStore) Stop() error {
 	ifn, fs := o.ifn, o.fs
 	o.mu.Unlock()
 
-	fs.RemoveConsumer(o)
+	err = fs.RemoveConsumer(o)
+	if err != nil {
+		log.Printf("OHDBG: error fs.RemoveConsumer(o) in Stop, err=[%s]", err)
+	}
 
 	if len(buf) > 0 {
 		o.waitOnFlusher()
@@ -8611,7 +9156,10 @@ func (o *consumerFileStore) delete(streamDeleted bool) error {
 	}
 
 	if !streamDeleted {
-		fs.RemoveConsumer(o)
+		err = fs.RemoveConsumer(o)
+		if err != nil {
+			log.Printf("OHDBG: error fs.RemoveConsumer(o) in delete, err=[%s]", err)
+		}
 	}
 
 	return err
